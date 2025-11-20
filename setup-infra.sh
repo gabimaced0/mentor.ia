@@ -121,51 +121,86 @@ az webapp config appsettings set \
     --settings APPINSIGHTS_INSTRUMENTATIONKEY=$INSTRUMENTATION_KEY
 
 # ==============================================================================
-# 6. CRIAÇÃO DO CONTAINER INSTANCE (RABBITMQ) COM PERSISTÊNCIA
+# 6. CRIAÇÃO DA INFRAESTRUTURA DE VM (RABBITMQ)
 # ==============================================================================
-echo "Criando Container Instance para RabbitMQ ($ACI_NAME)..."
-RABBITMQ_MNESIA_BASE="/var/lib/rabbitmq/mnesia" # Variável de correção de permissão
+echo "Criando Rede Virtual e IP Público..."
+az network vnet create --resource-group $RESOURCE_GROUP --name $VNET_NAME --location $LOCATION --address-prefix 10.0.0.0/16 --subnet-name $SUBNET_NAME --subnet-prefix 10.0.0.0/24
+az network public-ip create --resource-group $RESOURCE_GROUP --name $PUBLIC_IP_NAME --location $LOCATION --sku Standard --allocation-method Static
 
-az container create \
+echo "Criando NSG para controle de Firewall..."
+az network nsg create --resource-group $RESOURCE_GROUP --name $NSG_NAME
+
+# Criar Regra de Firewall: Permitir SSH (22)
+echo "Permitindo SSH (Porta 22) para acesso de manutenção à VM..."
+az network nsg rule create --resource-group $RESOURCE_GROUP --nsg-name $NSG_NAME --name AllowSSH \
+    --priority 100 --direction Inbound --access Allow --protocol Tcp --destination-port-range 22 --source-address-prefix Internet
+
+# Criar Regra de Firewall: Permitir AMQP (5672)
+echo "Permitindo RabbitMQ AMQP (Porta 5672) para conexão do App Service..."
+az network nsg rule create --resource-group $RESOURCE_GROUP --nsg-name $NSG_NAME --name AllowRabbitMQAMQP \
+    --priority 110 --direction Inbound --access Allow --protocol Tcp --destination-port-range 5672 --source-address-prefix Internet
+
+# Criar Regra de Firewall: Permitir Management UI (15672)
+echo "Permitindo RabbitMQ Management UI (Porta 15672) para acesso de gerenciamento..."
+az network nsg rule create --resource-group $RESOURCE_GROUP --nsg-name $NSG_NAME --name AllowRabbitMQWeb \
+    --priority 120 --direction Inbound --access Allow --protocol Tcp --destination-port-range 15672 --source-address-prefix Internet
+
+echo "Criando Máquina Virtual ($VM_NAME) e gerando chaves SSH..."
+az vm create \
     --resource-group $RESOURCE_GROUP \
-    --name $ACI_NAME \
-    --image $ACI_IMAGE \
-    --dns-name-label $ACI_DNS_LABEL \
-    --ports 5672 15672 \
-    --location $LOCATION \
-    --cpu 1 \
-    --memory 1.5 \
-    --os-type Linux \
-    --environment-variables RABBITMQ_DEFAULT_USER=$RABBITMQ_USER RABBITMQ_DEFAULT_PASS=$RABBITMQ_PASS RABBITMQ_MNESIA_BASE=$RABBITMQ_MNESIA_BASE \
-    --azure-file-volume-account-name $STORAGE_ACCOUNT_NAME \
-    --azure-file-volume-share-name $RABBITMQ_SHARE_NAME \
-    --azure-file-volume-mount-path /var/lib/rabbitmq \
-    --azure-file-volume-account-key $STORAGE_KEY
+    --name $VM_NAME \
+    --image $VM_IMAGE \
+    --size $VM_SIZE \
+    --admin-username $VM_ADMIN_USER \
+    --public-ip-address $PUBLIC_IP_NAME \
+    --vnet-name $VNET_NAME \
+    --subnet $SUBNET_NAME \
+    --nsg $NSG_NAME \
+    --generate-ssh-keys # Isso salva a chave privada na sua máquina (~/.ssh/id_rsa)
+
+# Obter o IP Público da VM
+VM_PUBLIC_IP=$(az network public-ip show --resource-group $RESOURCE_GROUP --name $PUBLIC_IP_NAME --query ipAddress --output tsv)
+echo "IP Público da VM RabbitMQ: $VM_PUBLIC_IP"
+
+
+# ==============================================================================
+# 6.1 EXECUTAR CONFIGURAÇÃO REMOTA NA VM
+# ==============================================================================
+echo "Aguardando a inicialização da VM e configurando o RabbitMQ via SSH..."
+
+# O comando SSH executa os passos: 1. Atualizar SO, 2. Instalar Docker, 3. Rodar RabbitMQ
+az vm run-command invoke \
+    --resource-group $RESOURCE_GROUP \
+    --name $VM_NAME \
+    --command-id RunShellScript \
+    --scripts "sudo apt update && \
+               sudo apt install -y docker.io && \
+               sudo docker run -d --name rabbitmq \
+               -p 5672:5672 -p 15672:15672 \
+               -e RABBITMQ_DEFAULT_USER=$RABBITMQ_USER \
+               -e RABBITMQ_DEFAULT_PASS=$RABBITMQ_PASS \
+               rabbitmq:3-management"
+
+echo "RabbitMQ Container está sendo executado na VM em $VM_PUBLIC_IP."
 
 # ==============================================================================
 # 7. CONFIGURAÇÃO FINAL - VINCULANDO RABBITMQ AO WEB APP
 # ==============================================================================
-echo "Vinculando o FQDN do RabbitMQ ao Web App ($WEB_APP_NAME)..."
-
-# Obtém o FQDN (Full Qualified Domain Name) do RabbitMQ ACI
-RABBITMQ_HOST_FQDN=$(az container show \
-    --resource-group $RESOURCE_GROUP \
-    --name $ACI_NAME \
-    --query ipAddress.fqdn -o tsv)
+echo "Vinculando o IP Público da VM RabbitMQ ao Web App ($WEB_APP_NAME)..."
 
 # Define as App Settings (variáveis de ambiente) no Web App
 az webapp config appsettings set \
     --name $WEB_APP_NAME \
     --resource-group $RESOURCE_GROUP \
-    --settings spring.rabbitmq.host=$RABBITMQ_HOST_FQDN \
+    --settings spring.rabbitmq.host=$VM_PUBLIC_IP \
              spring.rabbitmq.port=5672 \
              spring.rabbitmq.username=$RABBITMQ_USER \
              spring.rabbitmq.password=$RABBITMQ_PASS \
-             SPRING_DATASOURCE_URL="jdbc:sqlserver://$SQL_SERVER_NAME.database.windows.net:1433;database=$SQL_DB_NAME;user=$SQL_ADMIN_USER;password=$SQL_ADMIN_PASS;encrypt=true;trustServerCertificate=false;hostNameInCertificate=*.database.windows.net;loginTimeout=30;" \
-             SPRING_DATASOURCE_USERNAME=$SQL_ADMIN_USER \
-             SPRING_DATASOURCE_PASSWORD=$SQL_ADMIN_PASS \
-             GROK_PASS="<SUA_CHAVE_GROK>" \
-             APP_PASS_EMAIL="<SUA_SENHA_EMAIL>"
+             # ... Mantenha suas outras configurações de SQL, Groq, E-mail aqui
+             SPRING_DATASOURCE_URL="[SUA_URL_AZURE_SQL]" \
+             SPRING_DATASOURCE_USERNAME="[SEU_USUARIO_SQL]" \
+             SPRING_DATASOURCE_PASSWORD="[SUA_SENHA_SQL]" \
+             GROK_PASS="[SUA_CHAVE_GROK]" \
+             APP_PASS_EMAIL="[SUA_SENHA_EMAIL]"
 
-echo "Infraestrutura provisionada e RabbitMQ configurado!"
-echo "FQDN do RabbitMQ (para teste UI): http://$RABBITMQ_HOST_FQDN:15672"
+echo "Infraestrutura provisionada e RabbitMQ na VM configurado com IP: $VM_PUBLIC_IP."
